@@ -9,6 +9,11 @@
 #include <time.h>
 #include <unistd.h>
 
+// Definir CLOCK_MONOTONIC
+#ifndef CLOCK_MONOTONIC
+#define CLOCK_MONOTONIC 0
+#endif
+
 // Incluir stb_image.h para carregamento de imagens
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -22,12 +27,21 @@ typedef struct {
     char nome[256];        // Nome do arquivo
     int largura;          // Largura da imagem
     int altura;           // Altura da imagem
-    int canais;           // Número de canais (RGB = 3, RGBA = 4)
+    int canais;           // Número de canais
     unsigned char* dados; // Dados da imagem
 } Imagem;
 
+// Estrutura para Future
+typedef struct {
+    Imagem* resultado;
+    int concluido;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+} Future;
+
 typedef struct {
     Imagem* imagens;      // Array de imagens
+    Future** futures;     // Array de futures
     int capacidade;       // Tamanho máximo da fila
     int inicio;          // Índice do início da fila
     int fim;             // Índice do fim da fila
@@ -46,13 +60,14 @@ typedef struct {
 } ThreadArgs;
 
 // Adicionar após as declarações globais
-#define NUM_PRODUTORES 2
-#define NUM_CONSUMIDORES 2
+#define NUM_PRODUTORES 5
+#define NUM_CONSUMIDORES 5
 
 // Estrutura para métricas
 typedef struct {
     int imagens_processadas;
     double tempo_total;
+    int ordem_finalizacao;  // Nova variável para rastrear a ordem de finalização
 } Metricas;
 
 // Variáveis globais para métricas
@@ -60,21 +75,125 @@ Metricas metricas_produtores[NUM_PRODUTORES];
 Metricas metricas_consumidores[NUM_CONSUMIDORES];
 pthread_mutex_t mutex_metricas = PTHREAD_MUTEX_INITIALIZER;
 
-// Declarações das funções
-FilaImagens* criar_fila(int capacidade);
-void destruir_fila(FilaImagens* fila);
-int inserir_imagem(FilaImagens* fila, Imagem* img);
-int remover_imagem(FilaImagens* fila, Imagem* img);
-Imagem* carregar_imagem(const char* caminho);
-void liberar_imagem(Imagem* img);
-void* produtor(void* arg);
-void* consumidor(void* arg);
+// Variáveis para rastrear a ordem de finalização
+int ordem_finalizacao_produtores = 0;
+int ordem_finalizacao_consumidores = 0;
+pthread_mutex_t mutex_ordem = PTHREAD_MUTEX_INITIALIZER;
 
 // Variáveis globais para controle
 int executando = 1;  // Flag para controlar a execução das threads
 
-// Função para carregar uma imagem do disco
-Imagem* carregar_imagem(const char* caminho) {
+/**
+ * @brief Cria um novo Future para acompanhar o processamento de uma imagem
+ * @return Ponteiro para o Future criado, ou NULL em caso de erro
+ * 
+ * A função inicializa um Future com:
+ * - Mutex para sincronização
+ * - Variável de condição para espera
+ * - Flag de conclusão
+ * - Ponteiro para o resultado
+ * 
+ * É responsabilidade do chamador destruir o Future usando destruir_future().
+ */
+Future* criar_future() {
+    Future* future = (Future*)malloc(sizeof(Future));
+    if (!future) {
+        perror("Erro ao alocar Future");
+        return NULL;
+    }
+    
+    future->resultado = NULL;
+    future->concluido = 0;
+    pthread_mutex_init(&future->mutex, NULL);
+    pthread_cond_init(&future->cond, NULL);
+    
+    return future;
+}
+
+/**
+ * @brief Destrói um Future e libera seus recursos
+ * @param future Ponteiro para o Future a ser destruído
+ * 
+ * Libera todos os recursos associados ao Future, incluindo:
+ * - Mutex
+ * - Variável de condição
+ * - Estrutura do Future
+ */
+void destruir_future(Future* future) {
+    if (!future) return;
+    
+    pthread_mutex_destroy(&future->mutex);
+    pthread_cond_destroy(&future->cond);
+    free(future);
+}
+
+/**
+ * @brief Define o resultado de um Future
+ * @param future Ponteiro para o Future
+ * @param resultado Ponteiro para a imagem processada
+ * 
+ * A função:
+ * 1. Trava o mutex do Future
+ * 2. Define o resultado
+ * 3. Marca o Future como concluído
+ * 4. Sinaliza a variável de condição
+ * 5. Libera o mutex
+ */
+void definir_resultado_future(Future* future, Imagem* resultado) {
+    if (!future) return;
+    
+    pthread_mutex_lock(&future->mutex);
+    future->resultado = resultado;
+    future->concluido = 1;
+    pthread_cond_signal(&future->cond);
+    pthread_mutex_unlock(&future->mutex);
+}
+
+/**
+ * @brief Obtém o resultado de um Future (bloqueante)
+ * @param future Ponteiro para o Future
+ * @return Ponteiro para a imagem processada, ou NULL em caso de erro
+ * 
+ * A função bloqueia até que o Future seja concluído.
+ * Quando o resultado estiver disponível, retorna a imagem processada.
+ * Não libera a memória da imagem - isso é responsabilidade do chamador.
+ */
+Imagem* obter_resultado_future(Future* future) {
+    if (!future) return NULL;
+    
+    pthread_mutex_lock(&future->mutex);
+    while (!future->concluido) {
+        pthread_cond_wait(&future->cond, &future->mutex);
+    }
+    Imagem* resultado = future->resultado;
+    pthread_mutex_unlock(&future->mutex);
+    
+    return resultado;
+}
+
+// Declarações das funções
+FilaImagens* criar_fila(int capacidade);
+void destruir_fila(FilaImagens* fila);
+int inserir_imagem_na_fila(FilaImagens* fila, Imagem* img);
+int remover_imagem_da_fila(FilaImagens* fila, Imagem* img);
+void liberar_imagem_da_memoria(Imagem* img);
+void* produtor(void* arg);
+void* consumidor(void* arg);
+
+/**
+ * @brief Carrega uma imagem do disco para a memória
+ * @param caminho Caminho do arquivo de imagem a ser carregado
+ * @param produtor_id ID do produtor que está carregando a imagem (para logs)
+ * @return Ponteiro para a estrutura Imagem carregada, ou NULL em caso de erro
+ * 
+ * Esta função utiliza a biblioteca stb_image para carregar imagens em vários formatos
+ * (PNG, JPG, BMP, etc). A imagem é carregada em memória e suas dimensões e número
+ * de canais são detectados automaticamente.
+ * 
+ * A função aloca memória para a estrutura Imagem e seus dados. É responsabilidade
+ * do chamador liberar esta memória usando liberar_imagem_da_memoria().
+ */
+Imagem* carregar_imagem_do_disco(const char* caminho, int produtor_id) {
     Imagem* img = (Imagem*)malloc(sizeof(Imagem));
     if (!img) {
         perror("Erro ao alocar estrutura de imagem");
@@ -94,14 +213,20 @@ Imagem* carregar_imagem(const char* caminho) {
         return NULL;
     }
 
-    printf("Imagem carregada: %s (%dx%d, %d canais)\n", 
-           caminho, img->largura, img->altura, img->canais);
+    printf("Produtor %d: Carregou imagem %s (%dx%d, %d canais)\n", 
+           produtor_id, caminho, img->largura, img->altura, img->canais);
 
     return img;
 }
 
-// Função para liberar uma imagem
-void liberar_imagem(Imagem* img) {
+/**
+ * @brief Libera a memória alocada para uma imagem
+ * @param img Ponteiro para a estrutura Imagem a ser liberada
+ * 
+ * Esta função libera tanto a estrutura Imagem quanto os dados da imagem em si.
+ * É segura para chamar com NULL.
+ */
+void liberar_imagem_da_memoria(Imagem* img) {
     if (img) {
         if (img->dados) {
             stbi_image_free(img->dados);
@@ -110,8 +235,16 @@ void liberar_imagem(Imagem* img) {
     }
 }
 
-// Função para salvar uma imagem processada
-void salvar_imagem(Imagem* img, const char* diretorio_saida) {
+/**
+ * @brief Salva uma imagem processada no disco
+ * @param img Ponteiro para a estrutura Imagem a ser salva
+ * @param diretorio_saida Diretório onde a imagem será salva
+ * 
+ * A função detecta automaticamente o formato original da imagem e salva no mesmo formato.
+ * Se o formato não for reconhecido, salva como PNG.
+ * Utiliza a biblioteca stb_image_write para salvar a imagem.
+ */
+void salvar_imagem_no_disco(Imagem* img, const char* diretorio_saida) {
     if (!img || !img->dados) {
         printf("Erro: Imagem inválida para salvar.\n");
         return;
@@ -129,15 +262,44 @@ void salvar_imagem(Imagem* img, const char* diretorio_saida) {
     char caminho_saida[512];
     snprintf(caminho_saida, sizeof(caminho_saida), "%s/%s", diretorio_saida, nome_arquivo);
 
-    // Salvar a imagem no formato PNG
-    if (!stbi_write_png(caminho_saida, img->largura, img->altura, img->canais, img->dados, img->largura * img->canais)) {
+    // Detectar extensão do arquivo original
+    const char* extensao = strrchr(nome_arquivo, '.');
+    int sucesso = 0;
+    if (extensao) {
+        if (strcasecmp(extensao, ".png") == 0) {
+            sucesso = stbi_write_png(caminho_saida, img->largura, img->altura, img->canais, img->dados, img->largura * img->canais);
+        } else if (strcasecmp(extensao, ".jpg") == 0 || strcasecmp(extensao, ".jpeg") == 0) {
+            sucesso = stbi_write_jpg(caminho_saida, img->largura, img->altura, img->canais, img->dados, 90); // Qualidade 90
+        } else if (strcasecmp(extensao, ".bmp") == 0) {
+            sucesso = stbi_write_bmp(caminho_saida, img->largura, img->altura, img->canais, img->dados);
+        } else if (strcasecmp(extensao, ".tga") == 0) {
+            sucesso = stbi_write_tga(caminho_saida, img->largura, img->altura, img->canais, img->dados);
+        } else {
+            // Se extensão não reconhecida, salva como PNG
+            sucesso = stbi_write_png(caminho_saida, img->largura, img->altura, img->canais, img->dados, img->largura * img->canais);
+        }
+    } else {
+        // Se não tem extensão, salva como PNG
+        sucesso = stbi_write_png(caminho_saida, img->largura, img->altura, img->canais, img->dados, img->largura * img->canais);
+    }
+
+    if (!sucesso) {
         printf("Erro ao salvar imagem: %s\n", caminho_saida);
     } else {
         printf("Imagem salva com sucesso: %s\n", caminho_saida);
     }
 }
 
-// Funções de processamento de imagem
+/**
+ * @brief Converte uma imagem colorida para escala de cinza
+ * @param img Ponteiro para a estrutura Imagem a ser convertida
+ * 
+ * A função aplica a fórmula padrão de conversão para escala de cinza:
+ * cinza = 0.299R + 0.587G + 0.114B
+ * 
+ * A conversão é feita in-place, modificando os dados originais da imagem.
+ * Requer que a imagem tenha pelo menos 3 canais (RGB).
+ */
 void converter_para_cinza(Imagem* img) {
     if (!img || !img->dados || img->canais < 3) return;
     
@@ -148,6 +310,13 @@ void converter_para_cinza(Imagem* img) {
     }
 }
 
+/**
+ * @brief Inverte as cores de uma imagem
+ * @param img Ponteiro para a estrutura Imagem a ser invertida
+ * 
+ * A função inverte cada canal da imagem subtraindo seu valor de 255.
+ * A inversão é feita in-place, modificando os dados originais da imagem.
+ */
 void inverter_cores(Imagem* img) {
     if (!img || !img->dados) return;
     
@@ -156,6 +325,15 @@ void inverter_cores(Imagem* img) {
     }
 }
 
+/**
+ * @brief Ajusta o brilho de uma imagem
+ * @param img Ponteiro para a estrutura Imagem a ser ajustada
+ * @param fator Fator de multiplicação do brilho (1.0 = brilho original)
+ * 
+ * A função multiplica cada canal da imagem pelo fator especificado.
+ * Valores são limitados ao intervalo [0, 255].
+ * O ajuste é feito in-place, modificando os dados originais da imagem.
+ */
 void ajustar_brilho(Imagem* img, float fator) {
     if (!img || !img->dados) return;
     
@@ -165,6 +343,16 @@ void ajustar_brilho(Imagem* img, float fator) {
     }
 }
 
+/**
+ * @brief Ajusta o contraste de uma imagem
+ * @param img Ponteiro para a estrutura Imagem a ser ajustada
+ * @param fator Fator de multiplicação do contraste (1.0 = contraste original)
+ * 
+ * A função ajusta o contraste subtraindo 128 de cada valor,
+ * multiplicando pelo fator e adicionando 128 novamente.
+ * Valores são limitados ao intervalo [0, 255].
+ * O ajuste é feito in-place, modificando os dados originais da imagem.
+ */
 void ajustar_contraste(Imagem* img, float fator) {
     if (!img || !img->dados) return;
     
@@ -174,7 +362,15 @@ void ajustar_contraste(Imagem* img, float fator) {
     }
 }
 
-// Função para atualizar métricas
+/**
+ * @brief Atualiza as métricas de desempenho de uma thread
+ * @param thread_id ID da thread
+ * @param tipo_thread 0 para produtor, 1 para consumidor
+ * @param tempo_processamento Tempo gasto no processamento atual
+ * 
+ * Atualiza o número de imagens processadas e o tempo total
+ * de processamento para a thread especificada.
+ */
 void atualizar_metricas(int thread_id, int tipo_thread, double tempo_processamento) {
     pthread_mutex_lock(&mutex_metricas);
     if (tipo_thread == 0) { // Produtor
@@ -187,7 +383,36 @@ void atualizar_metricas(int thread_id, int tipo_thread, double tempo_processamen
     pthread_mutex_unlock(&mutex_metricas);
 }
 
-// Função do produtor modificada
+/**
+ * @brief Registra a ordem de finalização de uma thread
+ * @param thread_id ID da thread
+ * @param tipo_thread 0 para produtor, 1 para consumidor
+ * 
+ * Atualiza a ordem de finalização da thread no array de métricas.
+ * A ordem é mantida separadamente para produtores e consumidores.
+ */
+void registrar_finalizacao(int thread_id, int tipo_thread) {
+    pthread_mutex_lock(&mutex_ordem);
+    if (tipo_thread == 0) { // Produtor
+        metricas_produtores[thread_id].ordem_finalizacao = ++ordem_finalizacao_produtores;
+    } else { // Consumidor
+        metricas_consumidores[thread_id].ordem_finalizacao = ++ordem_finalizacao_consumidores;
+    }
+    pthread_mutex_unlock(&mutex_ordem);
+}
+
+/**
+ * @brief Função executada por cada thread produtora
+ * @param arg Argumentos da thread (ThreadArgs*)
+ * @return NULL
+ * 
+ * A thread produtora:
+ * 1. Lê arquivos do diretório de entrada
+ * 2. Carrega cada imagem encontrada
+ * 3. Insere a imagem na fila
+ * 4. Registra métricas de desempenho
+ * 5. Registra sua ordem de finalização
+ */
 void* produtor(void* arg) {
     ThreadArgs* args = (ThreadArgs*)arg;
     DIR* dir;
@@ -203,24 +428,24 @@ void* produtor(void* arg) {
     }
     
     while (executando && (ent = readdir(dir)) != NULL) {
-        if (ent->d_type == DT_REG) {
+        char caminho[512];
+        snprintf(caminho, sizeof(caminho), "%s/%s", args->diretorio_entrada, ent->d_name);
+
+        struct stat st;
+        if (stat(caminho, &st) == 0 && S_ISREG(st.st_mode)) {
             clock_gettime(CLOCK_MONOTONIC, &inicio);
             
-            char caminho[512];
-            snprintf(caminho, sizeof(caminho), "%s/%s", 
-                    args->diretorio_entrada, ent->d_name);
-            
-            Imagem* img = carregar_imagem(caminho);
+            Imagem* img = carregar_imagem_do_disco(caminho, args->thread_id);
             if (img) {
-                printf("Produtor %d: Carregando imagem %s\n", 
+                printf("Produtor %d: inserindo imagem %s na fila\n", 
                        args->thread_id, ent->d_name);
                 
-                if (inserir_imagem(args->fila, img)) {
+                if (inserir_imagem_na_fila(args->fila, img)) {
                     printf("Produtor %d: Imagem %s inserida na fila\n", 
                            args->thread_id, ent->d_name);
                 }
                 
-                liberar_imagem(img);
+                liberar_imagem_da_memoria(img);
             }
             
             clock_gettime(CLOCK_MONOTONIC, &fim);
@@ -231,11 +456,23 @@ void* produtor(void* arg) {
     }
     
     closedir(dir);
+    registrar_finalizacao(args->thread_id, 0);
     printf("Produtor %d finalizado\n", args->thread_id);
     return NULL;
 }
 
-// Função do consumidor modificada
+/**
+ * @brief Função executada por cada thread consumidora
+ * @param arg Argumentos da thread (ThreadArgs*)
+ * @return NULL
+ * 
+ * A thread consumidora:
+ * 1. Remove imagens da fila
+ * 2. Aplica transformações (cinza, inversão, brilho, contraste)
+ * 3. Salva a imagem processada
+ * 4. Registra métricas de desempenho
+ * 5. Registra sua ordem de finalização
+ */
 void* consumidor(void* arg) {
     ThreadArgs* args = (ThreadArgs*)arg;
     struct timespec inicio, fim;
@@ -244,19 +481,27 @@ void* consumidor(void* arg) {
     
     while (executando) {
         Imagem img;
+        Future* future = NULL;
         
-        if (remover_imagem(args->fila, &img)) {
+        if (remover_imagem_da_fila(args->fila, &img)) {
             clock_gettime(CLOCK_MONOTONIC, &inicio);
             
             printf("Consumidor %d: Processando imagem %s\n", 
                    args->thread_id, img.nome);
             
+            // Processa a imagem
             converter_para_cinza(&img);
             inverter_cores(&img);
             ajustar_brilho(&img, 1.2f);
             ajustar_contraste(&img, 1.3f);
             
-            salvar_imagem(&img, args->diretorio_saida);
+            // Salva a imagem processada
+            salvar_imagem_no_disco(&img, args->diretorio_saida);
+            
+            // Define o resultado no future
+            if (future) {
+                definir_resultado_future(future, &img);
+            }
             
             free(img.dados);
             
@@ -267,11 +512,21 @@ void* consumidor(void* arg) {
         }
     }
     
+    registrar_finalizacao(args->thread_id, 1);
     printf("Consumidor %d finalizado\n", args->thread_id);
     return NULL;
 }
 
-// Função para inicializar a fila
+/**
+ * @brief Cria uma nova fila de imagens
+ * @param capacidade Número máximo de imagens que a fila pode armazenar
+ * @return Ponteiro para a fila criada, ou NULL em caso de erro
+ * 
+ * A função inicializa uma fila circular com semáforos para controle de acesso.
+ * A fila é thread-safe e pode ser usada por múltiplos produtores e consumidores.
+ * 
+ * É responsabilidade do chamador destruir a fila usando destruir_fila().
+ */
 FilaImagens* criar_fila(int capacidade) {
     FilaImagens* fila = (FilaImagens*)malloc(sizeof(FilaImagens));
     if (!fila) {
@@ -282,6 +537,14 @@ FilaImagens* criar_fila(int capacidade) {
     fila->imagens = (Imagem*)malloc(capacidade * sizeof(Imagem));
     if (!fila->imagens) {
         perror("Erro ao alocar array de imagens");
+        free(fila);
+        return NULL;
+    }
+
+    fila->futures = (Future**)malloc(capacidade * sizeof(Future*));
+    if (!fila->futures) {
+        perror("Erro ao alocar array de futures");
+        free(fila->imagens);
         free(fila);
         return NULL;
     }
@@ -299,7 +562,16 @@ FilaImagens* criar_fila(int capacidade) {
     return fila;
 }
 
-// Função para destruir a fila
+/**
+ * @brief Destrói uma fila de imagens e libera seus recursos
+ * @param fila Ponteiro para a fila a ser destruída
+ * 
+ * Libera todos os recursos associados à fila, incluindo:
+ * - Mutex e semáforos
+ * - Array de imagens
+ * - Array de futures
+ * - Estrutura da fila
+ */
 void destruir_fila(FilaImagens* fila) {
     if (!fila) return;
 
@@ -310,11 +582,20 @@ void destruir_fila(FilaImagens* fila) {
 
     // Libera memória
     free(fila->imagens);
+    free(fila->futures);
     free(fila);
 }
 
-// Função para inserir uma imagem na fila
-int inserir_imagem(FilaImagens* fila, Imagem* img) {
+/**
+ * @brief Insere uma imagem na fila
+ * @param fila Ponteiro para a fila
+ * @param img Ponteiro para a imagem a ser inserida
+ * @return 1 se a inserção foi bem-sucedida, 0 caso contrário
+ * 
+ * A função é thread-safe e bloqueia se a fila estiver cheia.
+ * Cria um novo Future para a imagem inserida.
+ */
+int inserir_imagem_na_fila(FilaImagens* fila, Imagem* img) {
     if (!fila || !img) return 0;
 
     // Espera por um slot vazio
@@ -322,6 +603,14 @@ int inserir_imagem(FilaImagens* fila, Imagem* img) {
     
     // Trava o mutex para modificar a fila
     pthread_mutex_lock(&fila->mutex);
+
+    // Cria um novo future para a imagem
+    Future* future = criar_future();
+    if (!future) {
+        pthread_mutex_unlock(&fila->mutex);
+        sem_post(&fila->vazio);
+        return 0;
+    }
 
     // Copia a imagem para a fila
     strncpy(fila->imagens[fila->fim].nome, img->nome, sizeof(fila->imagens[fila->fim].nome) - 1);
@@ -336,6 +625,9 @@ int inserir_imagem(FilaImagens* fila, Imagem* img) {
         memcpy(fila->imagens[fila->fim].dados, img->dados, tamanho_dados);
     }
 
+    // Armazena o future
+    fila->futures[fila->fim] = future;
+
     // Atualiza índices da fila
     fila->fim = (fila->fim + 1) % fila->capacidade;
     fila->tamanho++;
@@ -349,8 +641,16 @@ int inserir_imagem(FilaImagens* fila, Imagem* img) {
     return 1;
 }
 
-// Função para remover uma imagem da fila
-int remover_imagem(FilaImagens* fila, Imagem* img) {
+/**
+ * @brief Remove uma imagem da fila
+ * @param fila Ponteiro para a fila
+ * @param img Ponteiro para onde a imagem será copiada
+ * @return 1 se a remoção foi bem-sucedida, 0 caso contrário
+ * 
+ * A função é thread-safe e bloqueia se a fila estiver vazia.
+ * Copia a imagem e seu Future associado.
+ */
+int remover_imagem_da_fila(FilaImagens* fila, Imagem* img) {
     if (!fila || !img) return 0;
 
     // Espera por um item na fila
@@ -358,6 +658,9 @@ int remover_imagem(FilaImagens* fila, Imagem* img) {
     
     // Trava o mutex para modificar a fila
     pthread_mutex_lock(&fila->mutex);
+
+    // Obtém o future da imagem
+    Future* future = fila->futures[fila->inicio];
 
     // Copia a imagem da fila
     strncpy(img->nome, fila->imagens[fila->inicio].nome, sizeof(img->nome) - 1);
@@ -376,6 +679,9 @@ int remover_imagem(FilaImagens* fila, Imagem* img) {
     free(fila->imagens[fila->inicio].dados);
     fila->imagens[fila->inicio].dados = NULL;
 
+    // Limpa o future
+    fila->futures[fila->inicio] = NULL;
+
     // Atualiza índices da fila
     fila->inicio = (fila->inicio + 1) % fila->capacidade;
     fila->tamanho--;
@@ -389,7 +695,21 @@ int remover_imagem(FilaImagens* fila, Imagem* img) {
     return 1;
 }
 
-// Função main modificada
+/**
+ * @brief Função principal do programa
+ * @return 0 em caso de sucesso, 1 em caso de erro
+ * 
+ * A função:
+ * 1. Inicializa a fila de imagens
+ * 2. Cria threads produtoras e consumidoras
+ * 3. Aguarda o processamento de todas as imagens
+ * 4. Coleta e exibe métricas de desempenho
+ * 5. Libera recursos
+ * 
+ * Diretórios padrão:
+ * - Entrada: "imagens/entrada"
+ * - Saída: "imagens/saida"
+ */
 int main() {
     printf("Iniciando Processador de Imagens Paralelo\n");
     printf("Número de produtores: %d\n", NUM_PRODUTORES);
@@ -461,25 +781,42 @@ int main() {
     double tempo_total = (fim_total.tv_sec - inicio_total.tv_sec) + 
                         (fim_total.tv_nsec - inicio_total.tv_nsec) / 1e9;
     
-    printf("\nMétricas de Desempenho:\n");
+    printf("\n=== Métricas de Desempenho ===\n");
     printf("Tempo total de execução: %.2f segundos\n", tempo_total);
     
-    printf("\nProdutores:\n");
+    printf("\n=== Produtores (%d threads) ===\n", NUM_PRODUTORES);
     for (int i = 0; i < NUM_PRODUTORES; i++) {
-        printf("Produtor %d: %d imagens, tempo médio: %.3f segundos\n",
-               i, metricas_produtores[i].imagens_processadas,
+        printf("Produtor %d:\n", i);
+        printf("  - Imagens carregadas do disco: %d\n", metricas_produtores[i].imagens_processadas);
+        printf("  - Tempo médio por imagem: %.3f segundos\n", 
                metricas_produtores[i].tempo_total / metricas_produtores[i].imagens_processadas);
+        printf("  - Tempo total de carregamento: %.3f segundos\n", 
+               metricas_produtores[i].tempo_total);
+        printf("  - \033[1;33mOrdem de finalização: %dº\033[0m\n", 
+               metricas_produtores[i].ordem_finalizacao);
     }
     
-    printf("\nConsumidores:\n");
+    printf("\n=== Consumidores (%d threads) ===\n", NUM_CONSUMIDORES);
     for (int i = 0; i < NUM_CONSUMIDORES; i++) {
-        printf("Consumidor %d: %d imagens, tempo médio: %.3f segundos\n",
-               i, metricas_consumidores[i].imagens_processadas,
+        printf("Consumidor %d:\n", i);
+        printf("  - Imagens processadas: %d\n", metricas_consumidores[i].imagens_processadas);
+        printf("  - Operações por imagem:\n");
+        printf("    * Conversão para escala de cinza\n");
+        printf("    * Inversão de cores\n");
+        printf("    * Ajuste de brilho (+20%%)\n");
+        printf("    * Ajuste de contraste (+30%%)\n");
+        printf("    * Salvamento no disco\n");
+        printf("  - Tempo médio por imagem: %.3f segundos\n", 
                metricas_consumidores[i].tempo_total / metricas_consumidores[i].imagens_processadas);
+        printf("  - Tempo total de processamento: %.3f segundos\n", 
+               metricas_consumidores[i].tempo_total);
+        printf("  - \033[1;33mOrdem de finalização: %dº\033[0m\n", 
+               metricas_consumidores[i].ordem_finalizacao);
     }
     
     // Limpeza
     pthread_mutex_destroy(&mutex_metricas);
+    pthread_mutex_destroy(&mutex_ordem);
     destruir_fila(fila);
     
     return 0;

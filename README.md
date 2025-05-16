@@ -58,7 +58,7 @@ curl -o stb_image_write.h https://raw.githubusercontent.com/nothings/stb/master/
 Para compilar o projeto, execute:
 
 ```bash
-gcc -o processador_imagens trab1.c -pthread
+gcc -o processador_imagens trab1.c -pthread -lm
 ```
 
 ## Execução
