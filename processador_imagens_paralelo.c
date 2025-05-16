@@ -239,12 +239,14 @@ void liberar_imagem_da_memoria(Imagem* img) {
  * @brief Salva uma imagem processada no disco
  * @param img Ponteiro para a estrutura Imagem a ser salva
  * @param diretorio_saida Diretório onde a imagem será salva
+ * @param consumidor_id ID do consumidor que processou a imagem
  * 
  * A função detecta automaticamente o formato original da imagem e salva no mesmo formato.
  * Se o formato não for reconhecido, salva como PNG.
  * Utiliza a biblioteca stb_image_write para salvar a imagem.
+ * O nome do arquivo de saída inclui o ID do consumidor para evitar conflitos.
  */
-void salvar_imagem_no_disco(Imagem* img, const char* diretorio_saida) {
+void salvar_imagem_no_disco(Imagem* img, const char* diretorio_saida, int consumidor_id) {
     if (!img || !img->dados) {
         printf("Erro: Imagem inválida para salvar.\n");
         return;
@@ -258,21 +260,37 @@ void salvar_imagem_no_disco(Imagem* img, const char* diretorio_saida) {
         nome_arquivo = img->nome;
     }
 
-    // Construir o caminho de saída
+    // Construir o caminho de saída com o ID do consumidor
     char caminho_saida[512];
-    snprintf(caminho_saida, sizeof(caminho_saida), "%s/%s", diretorio_saida, nome_arquivo);
+    char nome_base[256];
+    char extensao[32] = "";
+    
+    // Separar nome base e extensão
+    const char* ponto = strrchr(nome_arquivo, '.');
+    if (ponto) {
+        int pos = ponto - nome_arquivo;
+        strncpy(nome_base, nome_arquivo, pos);
+        nome_base[pos] = '\0';
+        strcpy(extensao, ponto);
+    } else {
+        strcpy(nome_base, nome_arquivo);
+    }
+    
+    // Construir novo nome com ID do consumidor
+    snprintf(caminho_saida, sizeof(caminho_saida), "%s/cons-%d-%s%s", 
+             diretorio_saida, consumidor_id, nome_base, extensao);
 
     // Detectar extensão do arquivo original
-    const char* extensao = strrchr(nome_arquivo, '.');
+    const char* extensao_original = strrchr(nome_arquivo, '.');
     int sucesso = 0;
-    if (extensao) {
-        if (strcasecmp(extensao, ".png") == 0) {
+    if (extensao_original) {
+        if (strcasecmp(extensao_original, ".png") == 0) {
             sucesso = stbi_write_png(caminho_saida, img->largura, img->altura, img->canais, img->dados, img->largura * img->canais);
-        } else if (strcasecmp(extensao, ".jpg") == 0 || strcasecmp(extensao, ".jpeg") == 0) {
+        } else if (strcasecmp(extensao_original, ".jpg") == 0 || strcasecmp(extensao_original, ".jpeg") == 0) {
             sucesso = stbi_write_jpg(caminho_saida, img->largura, img->altura, img->canais, img->dados, 90); // Qualidade 90
-        } else if (strcasecmp(extensao, ".bmp") == 0) {
+        } else if (strcasecmp(extensao_original, ".bmp") == 0) {
             sucesso = stbi_write_bmp(caminho_saida, img->largura, img->altura, img->canais, img->dados);
-        } else if (strcasecmp(extensao, ".tga") == 0) {
+        } else if (strcasecmp(extensao_original, ".tga") == 0) {
             sucesso = stbi_write_tga(caminho_saida, img->largura, img->altura, img->canais, img->dados);
         } else {
             // Se extensão não reconhecida, salva como PNG
@@ -495,8 +513,8 @@ void* consumidor(void* arg) {
             ajustar_brilho(&img, 1.2f);
             ajustar_contraste(&img, 1.3f);
             
-            // Salva a imagem processada
-            salvar_imagem_no_disco(&img, args->diretorio_saida);
+            // Salva a imagem processada com o ID do consumidor
+            salvar_imagem_no_disco(&img, args->diretorio_saida, args->thread_id);
             
             // Define o resultado no future
             if (future) {

@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  processador-imagens:
+    build: .
+    volumes:
+      - ./imagens/entrada:/app/imagens/entrada
+      - ./imagens/saida:/app/imagens/saida
+    environment:
+      - TZ=America/Sao_Paulo
+    # Comentado para permitir interação com o terminal
+    # stdin_open: true
+    # tty: true 

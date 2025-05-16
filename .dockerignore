@@ -1,0 +1,13 @@
+# Arquivos de imagem processados
+imagens/saida/*
+
+# Arquivos do sistema
+.git
+.gitignore
+.vscode
+*.swp
+*~
+
+# Arquivos de build
+*.o
+processador_imagens 

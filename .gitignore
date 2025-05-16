@@ -1,0 +1,16 @@
+# Arquivos compilados
+processador_imagens
+
+# Diretórios de imagens
+imagens/entrada/*
+imagens/saida/*
+
+# Arquivos do sistema
+.DS_Store
+.vscode/
+*.swp
+*~
+
+# Arquivos de build
+*.o
+*.out 
