@@ -5,7 +5,7 @@
 "Hoje vamos apresentar nosso Processador de Imagens Paralelo, um projeto desenvolvido em C que utiliza programação concorrente para processar múltiplas imagens simultaneamente."
 
 ## 2. Arquitetura e Padrões de Projeto (3 minutos)
-**Igor Ferreira:**
+**Eduardo Knopp:**
 "Vamos explicar os principais padrões de projeto utilizados:
 
 ### Padrão Produtor/Consumidor:
@@ -84,7 +84,7 @@ gcc -o processador_imagens processador_imagens_paralelo.c -pthread -lm
 Formatos suportados: PNG, JPG/JPEG, BMP, TGA"
 
 ## 5. Métricas e Desempenho (1 minuto)
-**Eduardo Knopp:**
+**Igor Ferreira:**
 "O sistema coleta métricas importantes:
 - Tempo total de execução
 - Número de imagens por thread
@@ -94,7 +94,7 @@ Formatos suportados: PNG, JPG/JPEG, BMP, TGA"
 Estas métricas nos permitem analisar o desempenho do sistema e identificar possíveis gargalos no processamento."
 
 ## 6. Demonstração (2 minutos)
-**Igor Ferreira:**
+**Eduardo Knopp:**
 "Vamos demonstrar o sistema em ação:
 1. Carregamento de imagens pelos produtores
 2. Processamento paralelo pelos consumidores
