@@ -62,6 +62,7 @@ typedef struct {
 // Adicionar após as declarações globais
 #define NUM_PRODUTORES 5
 #define NUM_CONSUMIDORES 5
+#define NUM_MONITORES 1
 
 // Estrutura para métricas
 typedef struct {
@@ -82,6 +83,47 @@ pthread_mutex_t mutex_ordem = PTHREAD_MUTEX_INITIALIZER;
 
 // Variáveis globais para controle
 int executando = 1;  // Flag para controlar a execução das threads
+
+// Estrutura para argumentos do monitor
+typedef struct {
+    FilaImagens* fila;
+    int thread_id;
+} MonitorArgs;
+
+// Função do monitor
+void* monitor(void* arg) {
+    MonitorArgs* args = (MonitorArgs*)arg;
+    printf("Monitor %d iniciado\n", args->thread_id);
+    
+    while (executando) {
+        // Verifica todas as posições da fila
+        for (int i = 0; i < args->fila->capacidade; i++) {
+            Future* future = args->fila->futures[i];
+            if (future) {
+                // Tenta obter o resultado de forma não-bloqueante
+                pthread_mutex_lock(&future->mutex);
+                if (future->concluido) {
+                    printf("Monitor %d: Imagem processada com sucesso na posição %d\n", 
+                           args->thread_id, i);
+                }
+                pthread_mutex_unlock(&future->mutex);
+            }
+        }
+        usleep(100000); // Dorme por 100ms
+    }
+    
+    printf("Monitor %d finalizado\n", args->thread_id);
+    return NULL;
+}
+
+// Declarações das funções
+FilaImagens* criar_fila(int capacidade);
+void destruir_fila(FilaImagens* fila);
+int inserir_imagem_na_fila(FilaImagens* fila, Imagem* img);
+int remover_imagem_da_fila(FilaImagens* fila, Imagem* img);
+void liberar_imagem_da_memoria(Imagem* img);
+void* produtor(void* arg);
+void* consumidor(void* arg);
 
 /**
  * @brief Cria um novo Future para acompanhar o processamento de uma imagem
@@ -170,15 +212,6 @@ Imagem* obter_resultado_future(Future* future) {
     
     return resultado;
 }
-
-// Declarações das funções
-FilaImagens* criar_fila(int capacidade);
-void destruir_fila(FilaImagens* fila);
-int inserir_imagem_na_fila(FilaImagens* fila, Imagem* img);
-int remover_imagem_da_fila(FilaImagens* fila, Imagem* img);
-void liberar_imagem_da_memoria(Imagem* img);
-void* produtor(void* arg);
-void* consumidor(void* arg);
 
 /**
  * @brief Carrega uma imagem do disco para a memória
@@ -513,11 +546,13 @@ void* consumidor(void* arg) {
             ajustar_brilho(&img, 1.2f);
             ajustar_contraste(&img, 1.3f);
             
-            // Salva a imagem processada com o ID do consumidor
+            // Salva a imagem processada
             salvar_imagem_no_disco(&img, args->diretorio_saida, args->thread_id);
             
             // Define o resultado no future
             if (future) {
+                printf("Consumidor %d: Definindo resultado no Future para imagem %s\n",
+                       args->thread_id, img.nome);
                 definir_resultado_future(future, &img);
             }
             
@@ -630,6 +665,8 @@ int inserir_imagem_na_fila(FilaImagens* fila, Imagem* img) {
         return 0;
     }
 
+    printf("Future criado para imagem: %s\n", img->nome);
+
     // Copia a imagem para a fila
     strncpy(fila->imagens[fila->fim].nome, img->nome, sizeof(fila->imagens[fila->fim].nome) - 1);
     fila->imagens[fila->fim].largura = img->largura;
@@ -645,6 +682,7 @@ int inserir_imagem_na_fila(FilaImagens* fila, Imagem* img) {
 
     // Armazena o future
     fila->futures[fila->fim] = future;
+    printf("Future armazenado na posição %d da fila\n", fila->fim);
 
     // Atualiza índices da fila
     fila->fim = (fila->fim + 1) % fila->capacidade;
@@ -778,6 +816,17 @@ int main() {
         }
     }
     
+    // Criar thread do monitor
+    pthread_t monitor_thread;
+    MonitorArgs args_monitor;
+    args_monitor.fila = fila;
+    args_monitor.thread_id = 0;
+    
+    if (pthread_create(&monitor_thread, NULL, monitor, &args_monitor) != 0) {
+        perror("Erro ao criar thread do monitor");
+        executando = 0;
+    }
+    
     // Aguardar todas as threads dos produtores terminarem
     for (int i = 0; i < NUM_PRODUTORES; i++) {
         pthread_join(prod_threads[i], NULL);
@@ -793,6 +842,9 @@ int main() {
     for (int i = 0; i < NUM_CONSUMIDORES; i++) {
         pthread_join(cons_threads[i], NULL);
     }
+    
+    // Aguardar thread do monitor
+    pthread_join(monitor_thread, NULL);
     
     // Calcular e exibir métricas
     clock_gettime(CLOCK_MONOTONIC, &fim_total);
