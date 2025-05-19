@@ -237,14 +237,17 @@ Imagem* carregar_imagem_do_disco(const char* caminho, int produtor_id) {
     strncpy(img->nome, caminho, sizeof(img->nome) - 1);
     img->nome[sizeof(img->nome) - 1] = '\0';
 
-    // Carrega a imagem usando stb_image
-    img->dados = stbi_load(caminho, &img->largura, &img->altura, &img->canais, 0);
+    // Carrega a imagem usando stb_image, forçando 3 canais (RGB)
+    img->dados = stbi_load(caminho, &img->largura, &img->altura, &img->canais, 3);
     
     if (!img->dados) {
         printf("Erro ao carregar imagem %s: %s\n", caminho, stbi_failure_reason());
         free(img);
         return NULL;
     }
+
+    // Força 3 canais
+    img->canais = 3;
 
     printf("Produtor %d: Carregou imagem %s (%dx%d, %d canais)\n", 
            produtor_id, caminho, img->largura, img->altura, img->canais);
