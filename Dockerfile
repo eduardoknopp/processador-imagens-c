@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y \
     make \
     git \
     vim \
+    libc6-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Criar diretório do projeto

@@ -29,6 +29,7 @@ typedef struct {
     int altura;           // Altura da imagem
     int canais;           // Número de canais
     unsigned char* dados; // Dados da imagem
+    int produtor_id;      // ID do produtor que inseriu a imagem
 } Imagem;
 
 // Estrutura para Future
@@ -93,26 +94,61 @@ typedef struct {
 // Função do monitor
 void* monitor(void* arg) {
     MonitorArgs* args = (MonitorArgs*)arg;
-    printf("Monitor %d iniciado\n", args->thread_id);
+    printf("\033[1;36m[MONITOR %d] Iniciado\033[0m\n", args->thread_id);
+    
+    // Array para rastrear o estado anterior de cada posição
+    int* estado_anterior = (int*)calloc(args->fila->capacidade, sizeof(int));
     
     while (executando) {
         // Verifica todas as posições da fila
+        pthread_mutex_lock(&args->fila->mutex);
+        printf("\033[1;36m[MONITOR %d] Estado atual da fila:\033[0m\n", args->thread_id);
+        printf("\033[1;36m[MONITOR %d] - Tamanho: %d/%d\033[0m\n", 
+               args->thread_id, args->fila->tamanho, args->fila->capacidade);
+        
         for (int i = 0; i < args->fila->capacidade; i++) {
             Future* future = args->fila->futures[i];
             if (future) {
-                // Tenta obter o resultado de forma não-bloqueante
                 pthread_mutex_lock(&future->mutex);
-                if (future->concluido) {
-                    printf("Monitor %d: Imagem processada com sucesso na posição %d\n", 
-                           args->thread_id, i);
+                // Extrai apenas o nome do arquivo do caminho completo
+                const char* nome_arquivo = strrchr(args->fila->imagens[i].nome, '/');
+                if (nome_arquivo) {
+                    nome_arquivo++; // Pula a barra
+                } else {
+                    nome_arquivo = args->fila->imagens[i].nome;
                 }
+                
+                int estado_atual = future->concluido;
+                
+                // Se o estado mudou de não processado para processado
+                if (estado_atual && !estado_anterior[i]) {
+                    printf("\033[1;32m[MONITOR %d] ✓ Imagem processada: %s [Produtor: %d]\033[0m\n",
+                           args->thread_id, nome_arquivo, args->fila->imagens[i].produtor_id);
+                }
+                
+                printf("\033[1;36m[MONITOR %d] Posição %d: %s (%s) [Produtor: %d]\033[0m\n", 
+                       args->thread_id, 
+                       i, 
+                       estado_atual ? "Processada" : "Em processamento",
+                       nome_arquivo,
+                       args->fila->imagens[i].produtor_id);
+                
+                estado_anterior[i] = estado_atual;
                 pthread_mutex_unlock(&future->mutex);
+            } else {
+                printf("\033[1;36m[MONITOR %d] Posição %d: Vazia\033[0m\n", 
+                       args->thread_id, i);
+                estado_anterior[i] = 0;
             }
         }
+        pthread_mutex_unlock(&args->fila->mutex);
+        
+        printf("\033[1;36m[MONITOR %d] Aguardando processamento...\033[0m\n", args->thread_id);
         usleep(100000); // Dorme por 100ms
     }
     
-    printf("Monitor %d finalizado\n", args->thread_id);
+    free(estado_anterior);
+    printf("\033[1;36m[MONITOR %d] Finalizado\033[0m\n", args->thread_id);
     return NULL;
 }
 
@@ -491,6 +527,7 @@ void* produtor(void* arg) {
             
             Imagem* img = carregar_imagem_do_disco(caminho, args->thread_id);
             if (img) {
+                img->produtor_id = args->thread_id;  // Define o ID do produtor
                 printf("Produtor %d: inserindo imagem %s na fila\n", 
                        args->thread_id, ent->d_name);
                 
@@ -537,34 +574,84 @@ void* consumidor(void* arg) {
         Imagem img;
         Future* future = NULL;
         
-        if (remover_imagem_da_fila(args->fila, &img)) {
-            clock_gettime(CLOCK_MONOTONIC, &inicio);
+        // Tenta remover imagem da fila com timeout
+        struct timespec timeout;
+        clock_gettime(CLOCK_MONOTONIC, &timeout);
+        timeout.tv_sec += 2; // 2 segundos de timeout
+        
+        // Tenta obter um item da fila com timeout
+        if (sem_timedwait(&args->fila->cheio, &timeout) == 0) {
+            pthread_mutex_lock(&args->fila->mutex);
             
-            printf("Consumidor %d: Processando imagem %s\n", 
-                   args->thread_id, img.nome);
-            
-            // Processa a imagem
-            converter_para_cinza(&img);
-            inverter_cores(&img);
-            ajustar_brilho(&img, 1.2f);
-            ajustar_contraste(&img, 1.3f);
-            
-            // Salva a imagem processada
-            salvar_imagem_no_disco(&img, args->diretorio_saida, args->thread_id);
-            
-            // Define o resultado no future
-            if (future) {
-                printf("Consumidor %d: Definindo resultado no Future para imagem %s\n",
+            // Verifica se ainda há imagens para processar
+            if (args->fila->tamanho > 0) {
+                // Obtém o future da imagem
+                future = args->fila->futures[args->fila->inicio];
+
+                // Copia a imagem da fila
+                strncpy(img.nome, args->fila->imagens[args->fila->inicio].nome, sizeof(img.nome) - 1);
+                img.largura = args->fila->imagens[args->fila->inicio].largura;
+                img.altura = args->fila->imagens[args->fila->inicio].altura;
+                img.canais = args->fila->imagens[args->fila->inicio].canais;
+                
+                // Aloca e copia os dados da imagem
+                size_t tamanho_dados = img.largura * img.altura * img.canais;
+                img.dados = (unsigned char*)malloc(tamanho_dados);
+                if (img.dados) {
+                    memcpy(img.dados, args->fila->imagens[args->fila->inicio].dados, tamanho_dados);
+                }
+
+                // Libera os dados da imagem na fila
+                free(args->fila->imagens[args->fila->inicio].dados);
+                args->fila->imagens[args->fila->inicio].dados = NULL;
+
+                // Limpa o future
+                args->fila->futures[args->fila->inicio] = NULL;
+
+                // Atualiza índices da fila
+                args->fila->inicio = (args->fila->inicio + 1) % args->fila->capacidade;
+                args->fila->tamanho--;
+
+                pthread_mutex_unlock(&args->fila->mutex);
+                sem_post(&args->fila->vazio);
+
+                clock_gettime(CLOCK_MONOTONIC, &inicio);
+                
+                printf("Consumidor %d: Processando imagem %s\n", 
                        args->thread_id, img.nome);
-                definir_resultado_future(future, &img);
+                
+                // Processa a imagem
+                converter_para_cinza(&img);
+                inverter_cores(&img);
+                ajustar_brilho(&img, 1.2f);
+                ajustar_contraste(&img, 1.3f);
+                
+                // Salva a imagem processada
+                salvar_imagem_no_disco(&img, args->diretorio_saida, args->thread_id);
+                
+                // Define o resultado no future
+                if (future) {
+                    printf("Consumidor %d: Definindo resultado no Future para imagem %s\n",
+                           args->thread_id, img.nome);
+                    definir_resultado_future(future, &img);
+                }
+                
+                free(img.dados);
+                
+                clock_gettime(CLOCK_MONOTONIC, &fim);
+                double tempo = (fim.tv_sec - inicio.tv_sec) + 
+                              (fim.tv_nsec - inicio.tv_nsec) / 1e9;
+                atualizar_metricas(args->thread_id, 1, tempo);
+            } else {
+                pthread_mutex_unlock(&args->fila->mutex);
+                sem_post(&args->fila->cheio);
+                break; // Sai do loop se não houver mais imagens
             }
-            
-            free(img.dados);
-            
-            clock_gettime(CLOCK_MONOTONIC, &fim);
-            double tempo = (fim.tv_sec - inicio.tv_sec) + 
-                          (fim.tv_nsec - inicio.tv_nsec) / 1e9;
-            atualizar_metricas(args->thread_id, 1, tempo);
+        } else {
+            // Timeout ocorreu, verifica se deve continuar
+            if (!executando || args->fila->tamanho == 0) {
+                break;
+            }
         }
     }
     
@@ -675,6 +762,7 @@ int inserir_imagem_na_fila(FilaImagens* fila, Imagem* img) {
     fila->imagens[fila->fim].largura = img->largura;
     fila->imagens[fila->fim].altura = img->altura;
     fila->imagens[fila->fim].canais = img->canais;
+    fila->imagens[fila->fim].produtor_id = img->produtor_id;  // Copia o ID do produtor
     
     // Aloca e copia os dados da imagem
     size_t tamanho_dados = img->largura * img->altura * img->canais;
