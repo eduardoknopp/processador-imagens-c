@@ -324,6 +324,12 @@ void salvar_imagem_no_disco(Imagem* img, const char* diretorio_saida, int consum
         return;
     }
 
+    // Garante que o diretório de saída existe
+    struct stat st = {0};
+    if (stat(diretorio_saida, &st) == -1) {
+        mkdir(diretorio_saida, 0700);
+    }
+
     // Extrair apenas o nome do arquivo do caminho completo
     const char* nome_arquivo = strrchr(img->nome, '/');
     if (nome_arquivo) {
@@ -351,6 +357,9 @@ void salvar_imagem_no_disco(Imagem* img, const char* diretorio_saida, int consum
     // Construir novo nome com ID do consumidor
     snprintf(caminho_saida, sizeof(caminho_saida), "%s/cons-%d-%s%s", 
              diretorio_saida, consumidor_id, nome_base, extensao);
+
+    printf("Tentando salvar imagem em: %s\n", caminho_saida);
+    printf("Dimensões: %dx%d, Canais: %d\n", img->largura, img->altura, img->canais);
 
     // Detectar extensão do arquivo original
     const char* extensao_original = strrchr(nome_arquivo, '.');
@@ -570,7 +579,7 @@ void* consumidor(void* arg) {
     
     printf("Consumidor %d iniciado\n", args->thread_id);
     
-    while (executando) {
+    while (1) {
         Imagem img;
         Future* future = NULL;
         
@@ -579,11 +588,9 @@ void* consumidor(void* arg) {
         clock_gettime(CLOCK_MONOTONIC, &timeout);
         timeout.tv_sec += 2; // 2 segundos de timeout
         
-        // Tenta obter um item da fila com timeout
-        if (sem_timedwait(&args->fila->cheio, &timeout) == 0) {
+        int sem_result = sem_timedwait(&args->fila->cheio, &timeout);
+        if (sem_result == 0) {
             pthread_mutex_lock(&args->fila->mutex);
-            
-            // Verifica se ainda há imagens para processar
             if (args->fila->tamanho > 0) {
                 // Obtém o future da imagem
                 future = args->fila->futures[args->fila->inicio];
@@ -593,6 +600,7 @@ void* consumidor(void* arg) {
                 img.largura = args->fila->imagens[args->fila->inicio].largura;
                 img.altura = args->fila->imagens[args->fila->inicio].altura;
                 img.canais = args->fila->imagens[args->fila->inicio].canais;
+                img.produtor_id = args->fila->imagens[args->fila->inicio].produtor_id;
                 
                 // Aloca e copia os dados da imagem
                 size_t tamanho_dados = img.largura * img.altura * img.canais;
@@ -644,14 +652,20 @@ void* consumidor(void* arg) {
                 atualizar_metricas(args->thread_id, 1, tempo);
             } else {
                 pthread_mutex_unlock(&args->fila->mutex);
-                sem_post(&args->fila->cheio);
-                break; // Sai do loop se não houver mais imagens
+                // Não faz break aqui, apenas continua tentando
+                usleep(10000); // Pequeno delay para evitar busy-wait
+                continue;
             }
         } else {
-            // Timeout ocorreu, verifica se deve continuar
-            if (!executando || args->fila->tamanho == 0) {
-                break;
+            // Timeout ocorreu
+            pthread_mutex_lock(&args->fila->mutex);
+            int fila_vazia = (args->fila->tamanho == 0);
+            pthread_mutex_unlock(&args->fila->mutex);
+            if (!executando && fila_vazia) {
+                break; // Só sai se não estiver executando e a fila estiver vazia
             }
+            // Caso contrário, continua tentando
+            usleep(10000);
         }
     }
     
